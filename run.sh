@@ -4,6 +4,8 @@ nproc_per_node="${nproc_per_node:=$ARNOLD_WORKER_GPU}"
 node_rank="${node_rank:=$ARNOLD_ID}"
 nnodes="${nnodes:=$ARNOLD_WORKER_NUM}"
 
+# export NVSHMEM_DEBUG=INFO
+# export NVSHMEM_DEBUG_FILE=/tmp/nvshmem_%h_%p.log
 
 torchrun \
   --node_rank=$node_rank \
