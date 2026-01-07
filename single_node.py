@@ -10,11 +10,10 @@ import torch.distributed._symmetric_memory._nvshmem_triton as nvshmem
 from torch.distributed._symmetric_memory._nvshmem_triton import requires_nvshmem
 
 
-@requires_nvshmem
 @triton.jit
-def put1_kernel(dst, src, pe: tl.constexpr):
-    nvshmem.put(dst, src, 1, pe)
-    nvshmem.quiet()  # force completion of GPU-initiated ops :contentReference[oaicite:1]{index=1}
+def dma_put1_kernel(peer_dst, src, offset: tl.constexpr):
+    x = tl.load(src)
+    tl.store(peer_dst + offset, x)
 
 
 def main():
@@ -37,8 +36,9 @@ def main():
 
     peer = 1 - rank
     offset = 10
+    peer_buf = hdl.get_buffer(peer, buffer.shape, buffer.dtype)
 
-    put1_kernel[(1,)](buffer[offset:], buffer, pe=peer)
+    dma_put1_kernel[(1,)](peer_buf, buffer, offset=offset)
     torch.cuda.synchronize()
     dist.barrier()
 
