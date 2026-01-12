@@ -9,7 +9,7 @@ nnodes="${nnodes:=$ARNOLD_WORKER_NUM}"
 
 torchrun \
   --node_rank=$node_rank \
-  --nproc_per_node=1 \
+  --nproc_per_node=$nproc_per_node \
   --nnodes=$nnodes \
   --rdzv_endpoint=${master_addr}:${master_port} \
   multi_node.py
