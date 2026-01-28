@@ -45,28 +45,34 @@ def ring_all_gather_kernel(
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < input_size
 
-    # ping-pong layout inside the symmetric buffer
-    buf0_base = 0
-    buf1_base = nprog * BLOCK_SIZE
+    # Ring staging/receive layout inside the symmetric buffer.
+    #
+    # We use **world_size** contiguous buffers of size (nprog * BLOCK_SIZE):
+    # - buffer 0: local input staging (padded) for step 0 send
+    # - buffer (s+1): receive buffer for ring step s
+    #
+    # This avoids reuse/overwrite of the same receive buffer (and its signal word)
+    # within a single kernel run, which can otherwise hang if some ranks start later
+    # and miss an earlier signal that gets overwritten by a later step.
+    buf_stride = nprog * BLOCK_SIZE
 
-    # Load local input -> buf0, and also write own rank into output
+    # Load local input -> staging buffer0 (padded), and also write own rank into output
     tmp = tl.load(input_buffer + offsets, mask=mask, other=0)
-    tl.store(local_buf_ptr + buf0_base + offsets, tmp, mask=mask)
+    tl.store(local_buf_ptr + offsets, tmp, mask=mask)
     tl.store(output_buffer + rank * input_size + offsets, tmp, mask=mask)
 
     # Ring steps
     for s in tl.static_range(0, world_size - 1):
-        send_base = buf0_base if (s & 1) == 0 else buf1_base
-        recv_base = buf1_base if (s & 1) == 0 else buf0_base
+        send_base = s * buf_stride
+        recv_base = (s + 1) * buf_stride
         recv_rank = (rank - 1 - s + world_size) % world_size
 
         # unique tag for nvshmem signals.
         send_tag = tl.full((), rank * world_size + (s + 1), tl.uint64)
         recv_tag = tl.full((), recv_src * world_size + (s + 1), tl.uint64)
 
-        # --- Signal slot selection (per parity + pid) ---
-        recv_parity = (s + 1) & 1
-        sig_idx = recv_parity * nprog + pid
+        # --- Signal slot selection (per step + pid) ---
+        sig_idx = (s + 1) * nprog + pid
         sig_ptr = flags + sig_idx  # symmetric address
 
         nvshmem.putmem_signal_block(
@@ -86,8 +92,13 @@ def ring_all_gather_kernel(
         )
         # print("after wait ", recv_tag)
 
-        # Now safe to read recv_base and store to output
-        tmp = tl.load(local_buf_ptr + recv_base + offsets, mask=mask)
+        # Now safe to read recv_base and store to output.
+        #
+        # Important: the recv buffer may have been previously accessed, so its lines can
+        # be resident in (per-SM) caches. Remote NVSHMEM puts do not
+        # necessarily invalidate those caches. Use a cache-bypassing load to reliably
+        # observe remote updates after the signal wait.
+        tmp = tl.load(local_buf_ptr + recv_base + offsets, mask=mask, cache_modifier=".cg")
         tl.store(output_buffer + recv_rank * input_size + offsets, tmp, mask=mask)
 
 
@@ -102,9 +113,8 @@ def main(args, rank, world_size, local_rank, local_world_size):
     dist.barrier()
 
     # --- flags ---
-    # 2 * nChannels uint64 signal words (one set per parity), per rank
-    flags = symm_mem.empty(2 * args.nChannels, dtype=torch.uint64, device=f"cuda:{local_rank}")
-    # flags = hdl.get_signal_pad(rank, (2 * args.nChannels,), dtype=torch.int64).fill_(0)
+    # world_size * nChannels uint64 signal words (one set per ring step buffer, per pid), per rank
+    flags = symm_mem.empty(world_size * args.nChannels, dtype=torch.uint64, device=f"cuda:{local_rank}")
     _flags_hdl = symm_mem.rendezvous(flags, dist.group.WORLD.group_name)
     # flags_ptrs = torch.tensor(_flags_hdl.buffer_ptrs, device=f"cuda:{local_rank}", dtype=torch.int64)
     dist.barrier()
@@ -119,17 +129,22 @@ def main(args, rank, world_size, local_rank, local_world_size):
     expected = torch.empty((world_size * args.input_size,), dtype=torch.int8, device=f"cuda:{local_rank}")
     output_tensor = torch.empty_like(expected)
     dist.all_gather_into_tensor(expected, input_tensor)
-    dist.barrier()
     torch.cuda.synchronize()
+    dist.barrier()
 
     BLOCK_SIZE = triton.cdiv(args.input_size, args.nChannels * NCCL_PAD_UNIT) * NCCL_PAD_UNIT
     assert BLOCK_SIZE < 1024 * 16, f"ERROR: {BLOCK_SIZE} > 1024 * 16, very slow to compile."
-    need_bytes = 2 * args.nChannels * BLOCK_SIZE
+    need_bytes = world_size * args.nChannels * BLOCK_SIZE
     assert args.symm_buffer_size >= need_bytes, f"symm buffer too small: need >= {need_bytes} bytes"
 
-    # # flags must be reset before each kernel launch because tag = s+1 relies on zeroed flags
-    # flags.zero_()
-    # dist.barrier()
+    # flags must be reset before each kernel launch.
+    # Otherwise `signal_wait_until(..., EQ, tag)` can spuriously succeed if the signal words
+    # contain garbage (or tags from a previous launch).
+    flags.zero_()
+    # Make sure the memset is complete on all ranks before any peer starts
+    # signaling into these words.
+    torch.cuda.synchronize()
+    dist.barrier()
 
     print("before the kernel launch")
     ring_all_gather_kernel[(args.nChannels,)](
@@ -147,8 +162,8 @@ def main(args, rank, world_size, local_rank, local_world_size):
         num_warps=args.nWarps,
     )
 
-    dist.barrier()
     torch.cuda.synchronize()
+    dist.barrier()
 
     print_per_rank(
         f"[rank{rank}] input_tensor[:16]   = {input_tensor[:16].detach().cpu().tolist()}\n"
