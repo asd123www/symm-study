@@ -30,6 +30,7 @@ def ring_all_gather_kernel(
     buf_ptrs,
     local_buf_ptr,
     flags,
+    sync_word,
     rank: tl.constexpr,
     node_start: tl.constexpr,
     node_end: tl.constexpr,
@@ -81,7 +82,9 @@ def ring_all_gather_kernel(
             size_bytes = tl.full((), BLOCK_SIZE, tl.int64),
             signal = sig_ptr,  # remote signal word addr on send_dst
             sig_val = send_tag,      # signal value
-            sig_op = 0,        # NVSHMEM_SIGNAL_SET=0
+            # NVSHMEM signal op values are **not** 0/5 on all builds.
+            # On NVSHMEM 3.x (and CUDA toolkit builds) NVSHMEM_SIGNAL_SET is 9.
+            sig_op = 9,        # NVSHMEM_SIGNAL_SET
             pe = send_dst,
         )
         # print("before wait ", recv_tag)
@@ -91,6 +94,19 @@ def ring_all_gather_kernel(
             cmp_val=recv_tag,
         )
         # print("after wait ", recv_tag)
+
+        # On remote (IB/UCX/proxy) transports, the signal becoming visible does *not*
+        # necessarily imply the receiving SM will immediately observe the newly written
+        # data due to GPU cache consistency rules. NVSHMEM's wait/test APIs normally
+        # execute an internal "syncapi_update_mem()" to enforce visibility.
+        #
+        # `nvshmem_signal_wait_until` does not perform that update on all NVSHMEM builds,
+        # so we force it via a trivially-satisfied 32-bit wait.
+        nvshmem.wait_until(
+            ivar=sync_word,
+            cmp_op=0,   # NVSHMEM_CMP_EQ
+            cmp_val=0,  # always satisfied (sync_word is kept at 0)
+        )
 
         # Now safe to read recv_base and store to output.
         #
@@ -119,6 +135,12 @@ def main(args, rank, world_size, local_rank, local_world_size):
     # flags_ptrs = torch.tensor(_flags_hdl.buffer_ptrs, device=f"cuda:{local_rank}", dtype=torch.int64)
     dist.barrier()
 
+    # A single 32-bit symmetric word used to trigger NVSHMEM "syncapi_update_mem" via wait_until.
+    # This is needed for correctness on some remote transports where cache coherence is weaker.
+    sync_word = symm_mem.empty((1,), dtype=torch.int32, device=f"cuda:{local_rank}")
+    _sync_hdl = symm_mem.rendezvous(sync_word, dist.group.WORLD.group_name)
+    dist.barrier()
+
     buf_ptrs = torch.tensor(hdl.buffer_ptrs, device=f"cuda:{local_rank}", dtype=torch.int64)
 
     root_node = rank // local_world_size
@@ -141,6 +163,7 @@ def main(args, rank, world_size, local_rank, local_world_size):
     # Otherwise `signal_wait_until(..., EQ, tag)` can spuriously succeed if the signal words
     # contain garbage (or tags from a previous launch).
     flags.zero_()
+    sync_word.zero_()
     # Make sure the memset is complete on all ranks before any peer starts
     # signaling into these words.
     torch.cuda.synchronize()
@@ -154,6 +177,7 @@ def main(args, rank, world_size, local_rank, local_world_size):
         buf_ptrs,
         buf,
         flags,
+        sync_word,
         rank=rank,
         node_start=node_start,
         node_end=node_end,
